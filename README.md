@@ -52,5 +52,6 @@ streamlit run main.py
 
 Navigate to the provided URL in your web browser to use the application.
 
-![example]("Screenshot from 2024-09-16 23-23-48.png")
-![example]("Screenshot from 2024-09-16 23-23-55.png")
+![example](https://github.com/Balogunolalere/rag-chromadb-groq/blob/main/Screenshot%20from%202024-09-16%2023-23-48.png?raw=true)
+
+![example](https://github.com/Balogunolalere/rag-chromadb-groq/blob/main/Screenshot%20from%202024-09-16%2023-23-55.png?raw=true)
