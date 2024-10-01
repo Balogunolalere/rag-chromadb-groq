@@ -9,15 +9,17 @@ from dotenv import load_dotenv
 from io import BytesIO
 import logging
 from functools import lru_cache
-from collections import deque
 
 import spacy
 from langdetect import detect
+from textstat import flesch_reading_ease
 
 import chromadb
 from chromadb.utils import embedding_functions
 
 from PyPDF2 import PdfReader
+import docx
+
 
 # Configuration
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +43,6 @@ def load_spacy_model():
         return spacy.load("en_core_web_lg")
 
 nlp = load_spacy_model()
-
 
 def check_env_vars():
     missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
@@ -69,47 +70,20 @@ def cached_api_call(messages: Tuple[Tuple[str, str]], max_tokens: int) -> str:
     )
     return response.choices[0].message.content
 
-# Text Chunking
-class TextChunker:
-    def chunk_text(self, text: str) -> List[str]:
-        raise NotImplementedError("Subclasses must implement this method")
-
-class SlidingWindowChunker(TextChunker):
-    def __init__(self, chunk_size: int = 1000, overlap: int = 200):
-        self.chunk_size = chunk_size
-        self.overlap = overlap
-
-    def chunk_text(self, text: str) -> List[str]:
-        doc = nlp(text)
-        sentences = list(doc.sents)
-        chunks = []
-        window = deque(maxlen=self.chunk_size)
-        current_size = 0
-
-        for sentence in sentences:
-            sentence_size = len(sentence.text.split())
-            
-            if current_size + sentence_size > self.chunk_size:
-                chunks.append(" ".join([s.text for s in window]))
-                while current_size > self.overlap:
-                    removed = window.popleft()
-                    current_size -= len(removed.text.split())
-            
-            window.append(sentence)
-            current_size += sentence_size
-
-        if window:
-            chunks.append(" ".join([s.text for s in window]))
-
-        return chunks
-
-class SemanticChunker(TextChunker):
-    def __init__(self, max_chunk_size: int = 1000, similarity_threshold: float = 0.5):
+# Updated HybridChunker Class
+class HybridChunker:
+    def __init__(self, max_chunk_size: int = 1000, overlap: int = 200, similarity_threshold: float = 0.5,
+                 use_semantic: bool = True, use_hierarchical: bool = True, adaptive_chunking: bool = True):
         self.max_chunk_size = max_chunk_size
+        self.overlap = overlap
         self.similarity_threshold = similarity_threshold
+        self.use_semantic = use_semantic
+        self.use_hierarchical = use_hierarchical
+        self.adaptive_chunking = adaptive_chunking
+        self.nlp = spacy.load("en_core_web_lg")
 
     def chunk_text(self, text: str) -> List[str]:
-        doc = nlp(text)
+        doc = self.nlp(text)
         sentences = list(doc.sents)
         chunks = []
         current_chunk = []
@@ -117,35 +91,65 @@ class SemanticChunker(TextChunker):
 
         for i, sentence in enumerate(sentences):
             sentence_size = len(sentence.text.split())
-            if current_size + sentence_size > self.max_chunk_size:
+            
+            # Adaptive Chunk Sizing
+            if self.adaptive_chunking:
+                chunk_size_limit = self._calculate_adaptive_chunk_size(sentence.text)
+            else:
+                chunk_size_limit = self.max_chunk_size
+
+            if current_size + sentence_size > chunk_size_limit:
                 if current_chunk:
-                    chunks.append(" ".join([s.text for s in current_chunk]))
-                    current_chunk = []
+                    chunks.append(self._process_chunk(current_chunk))
+                    overlap_size = sum(len(s.text.split()) for s in current_chunk[-2:])
+                    current_chunk = current_chunk[-2:] if len(current_chunk) > 2 else []
+                    current_size = overlap_size
+                else:
                     current_size = 0
 
             current_chunk.append(sentence)
             current_size += sentence_size
 
-            if i < len(sentences) - 1:
+            # Check for semantic similarity
+            if self.use_semantic and i < len(sentences) - 1:
                 next_sentence = sentences[i + 1]
                 similarity = sentence.similarity(next_sentence)
-                if similarity < self.similarity_threshold and current_size >= self.max_chunk_size // 2:
-                    chunks.append(" ".join([s.text for s in current_chunk]))
-                    current_chunk = []
-                    current_size = 0
+                if similarity < self.similarity_threshold and current_size >= chunk_size_limit // 2:
+                    chunks.append(self._process_chunk(current_chunk))
+                    overlap_size = sum(len(s.text.split()) for s in current_chunk[-2:])
+                    current_chunk = current_chunk[-2:] if len(current_chunk) > 2 else []
+                    current_size = overlap_size
 
         if current_chunk:
-            chunks.append(" ".join([s.text for s in current_chunk]))
+            chunks.append(self._process_chunk(current_chunk))
 
-        return chunks
+        # Hierarchical chunking if enabled
+        if self.use_hierarchical:
+            return self._hierarchical_chunking(chunks)
+        else:
+            return chunks
 
-def get_chunker(method: str) -> TextChunker:
-    if method == "sliding_window":
-        return SlidingWindowChunker()
-    elif method == "semantic":
-        return SemanticChunker()
-    else:
-        raise ValueError("Invalid chunking method. Choose 'sliding_window' or 'semantic'.")
+    def _process_chunk(self, chunk: List[spacy.tokens.Span]) -> str:
+        """Joins sentences to form a chunk, preserving paragraph structure."""
+        return " ".join([s.text for s in chunk])
+
+    def _calculate_adaptive_chunk_size(self, text: str) -> int:
+        """Uses readability score or sentence complexity to adjust chunk size."""
+        score = flesch_reading_ease(text)
+        if score < 60:  # More complex text, reduce chunk size
+            return int(self.max_chunk_size * 0.8)
+        else:  # Simpler text, allow larger chunks
+            return self.max_chunk_size
+
+    def _hierarchical_chunking(self, chunks: List[str]) -> List[str]:
+        """Implements hierarchical chunking with larger overlapping chunks."""
+        hierarchical_chunks = []
+        for i in range(len(chunks)):
+            # Create larger overlapping chunks
+            if i + 2 < len(chunks):
+                larger_chunk = " ".join([chunks[i], chunks[i + 1], chunks[i + 2]])
+                hierarchical_chunks.append(larger_chunk)
+        return hierarchical_chunks + chunks
 
 # Document Processing
 def process_pdf(file: BytesIO) -> Tuple[str, Dict[str, Any]]:
@@ -171,6 +175,42 @@ def process_pdf(file: BytesIO) -> Tuple[str, Dict[str, Any]]:
 
     return text, metadata
 
+def process_docx(file: BytesIO) -> Tuple[str, Dict[str, Any]]:
+    text = ""
+    metadata = {"paragraphs": []}
+
+    try:
+        doc = docx.Document(file)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+            metadata["paragraphs"].append(para.text)
+
+        metadata["num_paragraphs"] = len(doc.paragraphs)
+        metadata["core_properties"] = {
+            prop: getattr(doc.core_properties, prop)
+            for prop in dir(doc.core_properties)
+            if not prop.startswith("_") and prop != "custom_properties"
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing DOCX: {str(e)}")
+        raise
+
+    return text, metadata
+
+def process_json(file: BytesIO) -> Tuple[str, Dict[str, Any]]:
+    try:
+        content = json.load(file)
+        text = json.dumps(content, indent=2)
+        metadata = {
+            "top_level_keys": list(content.keys()) if isinstance(content, dict) else [],
+            "size": len(text)
+        }
+        return text, metadata
+    except json.JSONDecodeError as e:
+        logger.error(f"Error processing JSON: {str(e)}")
+        raise
+
 def safe_file_read(file, fallback_encoding='latin1'):
     try:
         return file.read().decode('utf-8')
@@ -181,7 +221,6 @@ def safe_file_read(file, fallback_encoding='latin1'):
 def clean_text(text: str) -> str:
     text = " ".join(text.split())
     return ''.join(char for char in text if char.isprintable() or char.isspace())
-
 # Storage Management
 def clean_storage():
     global chroma_client, collection
@@ -202,56 +241,62 @@ def clean_storage():
 
 # Document Upload
 def upload_document():
-    uploaded_file = st.file_uploader("Upload a PDF or TXT file", type=["pdf", "txt"])
+    uploaded_file = st.file_uploader("Upload a PDF, TXT, JSON, or DOCX file", type=["pdf", "txt", "json", "docx"])
 
     if uploaded_file is not None:
         if uploaded_file.name in st.session_state.document_metadata:
             st.warning(f"Document '{uploaded_file.name}' has already been processed.")
             return
 
-        if uploaded_file.type == "application/pdf":
-            text, metadata = process_pdf(BytesIO(uploaded_file.getvalue()))
-        elif uploaded_file.type == "text/plain":
-            text = safe_file_read(uploaded_file)
-            metadata = {"type": "txt"}
-
-        text = clean_text(text)
-
         try:
-            language = detect(text)
-        except:
-            language = "unknown"
+            if uploaded_file.type == "application/pdf":
+                text, metadata = process_pdf(BytesIO(uploaded_file.getvalue()))
+            elif uploaded_file.type == "text/plain":
+                text = safe_file_read(uploaded_file)
+                metadata = {"type": "txt"}
+            elif uploaded_file.type == "application/json":
+                text, metadata = process_json(BytesIO(uploaded_file.getvalue()))
+            elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                text, metadata = process_docx(BytesIO(uploaded_file.getvalue()))
+            else:
+                st.error(f"Unsupported file type: {uploaded_file.type}")
+                return
 
-        metadata.update({
-            "language": language,
-            "file_name": uploaded_file.name,
-            "file_size": uploaded_file.size
-        })
+            text = clean_text(text)
 
-        if "pages" in metadata:
-            del metadata["pages"]
+            try:
+                language = detect(text)
+            except:
+                language = "unknown"
 
-        for key, value in metadata.items():
-            if isinstance(value, (list, dict)):
-                metadata[key] = json.dumps(value)
+            metadata.update({
+                "language": language,
+                "file_name": uploaded_file.name,
+                "file_size": uploaded_file.size,
+                "file_type": uploaded_file.type
+            })
 
-        chunking_method = st.selectbox("Choose chunking method:", ["sliding_window", "semantic"])
-        chunker = get_chunker(chunking_method)
-        passages = chunker.chunk_text(text)
+            # Using the updated HybridChunker
+            chunker = HybridChunker()
+            passages = chunker.chunk_text(text)
 
-        ids = [f"{uploaded_file.name}_{i}" for i in range(len(passages))]
+            ids = [f"{uploaded_file.name}_{i}" for i in range(len(passages))]
 
-        collection.add(
-            ids=ids,
-            documents=passages,
-            metadatas=[{"chunk_id": i, "source": uploaded_file.name} for i in range(len(passages))]
-        )
+            collection.add(
+                ids=ids,
+                documents=passages,
+                metadatas=[{"chunk_id": i, "source": uploaded_file.name} for i in range(len(passages))]
+            )
 
-        st.session_state.document_metadata[uploaded_file.name] = metadata
+            st.session_state.document_metadata[uploaded_file.name] = metadata
 
-        st.success(f"Document '{uploaded_file.name}' uploaded and processed successfully!")
-        st.write("Document Details:")
-        st.json(metadata)
+            st.success(f"Document '{uploaded_file.name}' uploaded and processed successfully!")
+            st.write("Document Details:")
+            st.json(metadata)
+
+        except Exception as e:
+            st.error(f"An error occurred while processing the file: {str(e)}")
+            logger.error(f"Error in upload_document: {str(e)}", exc_info=True)
 
 # Query Processing
 def retrieve_relevant_passages(query: str) -> List[str]:
@@ -347,10 +392,27 @@ def show_history():
             st.write(f"**Query**: {entry['query']}")
             st.write(f"**Response**: {entry['response']}")
             st.write(f"**Time**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['timestamp']))}")
+            if 'file_type' in entry:
+                st.write(f"**File Type**: {entry['file_type']}")
             st.write("---")
     except FileNotFoundError:
         st.write("No history available.")
 
+# Document Management
+def view_uploaded_documents():
+    if not st.session_state.document_metadata:
+        st.write("No documents have been uploaded yet.")
+    else:
+        for filename, metadata in st.session_state.document_metadata.items():
+            st.write(f"**Filename**: {filename}")
+            st.write(f"**File Type**: {metadata.get('file_type', 'Unknown')}")
+            st.write(f"**File Size**: {metadata.get('file_size', 'Unknown')} bytes")
+            st.write(f"**Language**: {metadata.get('language', 'Unknown')}")
+            if 'num_pages' in metadata:
+                st.write(f"**Number of Pages**: {metadata['num_pages']}")
+            elif 'num_paragraphs' in metadata:
+                st.write(f"**Number of Paragraphs**: {metadata['num_paragraphs']}")
+            st.write("---")
 
 # Main Application
 def main():
@@ -378,9 +440,9 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown('<p class="big-font">Upload PDF or TXT files, create a searchable knowledge base, and query documents using retrieval-augmented generation.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="big-font">Upload PDF, TXT, JSON, or DOCX files, create a searchable knowledge base, and query documents using retrieval-augmented generation.</p>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
         upload_document()
@@ -388,6 +450,10 @@ def main():
     with col2:
         if st.button("Clean Storage"):
             clean_storage()
+
+    with col3:
+        if st.button("View Uploaded Documents"):
+            view_uploaded_documents()
 
     user_query = st.text_input("Enter your query:", placeholder="e.g., What is the main idea of the document?")
     submit_button = st.button("Submit Query")
@@ -419,4 +485,6 @@ def main():
         show_history()
 
 if __name__ == "__main__":
+    if 'document_metadata' not in st.session_state:
+        st.session_state.document_metadata = {}
     main()
